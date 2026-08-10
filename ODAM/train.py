@@ -1,0 +1,2070 @@
+#!/usr/bin/env python3
+"""
+train.py
+========
+
+Huấn luyện và đánh giá 3 biến thể trên CÙNG một pipeline:
+
+    1) baseline : Faster R-CNN
+    2) odam     : Faster R-CNN + ODAM-Train
+    3) dpga     : Faster R-CNN + DPGA-ODAM
+
+Yêu cầu dataset:
+    COCO JSON detection format.
+
+Phụ thuộc:
+    pip install torch torchvision pycocotools pillow numpy tqdm
+
+Ví dụ:
+--------
+# Faster R-CNN baseline
+python train.py \
+    --method baseline \
+    --train-images /data/train \
+    --train-ann /data/annotations/train.json \
+    --val-images /data/val \
+    --val-ann /data/annotations/val.json \
+    --output runs/baseline
+
+# Faster R-CNN + ODAM
+python train.py \
+    --method odam \
+    --odam-weight 0.2 \
+    --train-images /data/train \
+    --train-ann /data/annotations/train.json \
+    --val-images /data/val \
+    --val-ann /data/annotations/val.json \
+    --output runs/odam
+
+# Faster R-CNN + DPGA-ODAM
+python train.py \
+    --method dpga \
+    --dpga-warmup 4 \
+    --dpga-rampup 4 \
+    --train-images /data/train \
+    --train-ann /data/annotations/train.json \
+    --val-images /data/val \
+    --val-ann /data/annotations/val.json \
+    --output runs/dpga
+
+Multi-GPU (torchrun):
+---------------------
+torchrun --nproc_per_node=2 train.py ...same args...
+
+Metrics:
+--------
+COCO:
+    AP       = AP@[IoU=.50:.95]
+    AP50
+    AP75
+    AP_small / AP_medium / AP_large
+    AR1 / AR10 / AR100
+
+Pedestrian-only optional:
+    MR-2_generic:
+        log-average miss rate tại FPPI 10^-2 ... 10^0, IoU=0.5.
+
+QUAN TRỌNG:
+    MR-2_generic trong file này KHÔNG thay thế evaluator chính thức của
+    CityPersons "Reasonable" vì protocol CityPersons còn có filtering theo
+    chiều cao/visibility/ignore regions. Script xuất COCO prediction JSON để
+    bạn có thể chạy evaluator chính thức riêng cho paper.
+
+Scientific fairness:
+--------------------
+Mọi method dùng cùng:
+    - Network architecture
+    - train/val split
+    - seed
+    - optimizer
+    - learning-rate schedule
+    - resize
+    - NMS/evaluation threshold
+
+Chỉ khác:
+    baseline:
+        L = L_det
+        và tắt hoàn toàn nhánh ODAM trong training.
+
+    odam:
+        L = L_det + lambda_odam * L_odam
+
+    dpga:
+        không gọi total_loss.backward();
+        DPGAController tạo:
+            g_final^(m)
+              = g_det^(m)
+              + alpha(epoch) * gate_m * g_odam_safe^(m)
+"""
+
+import argparse
+import csv
+import json
+import math
+import os
+import random
+import time
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+from PIL import Image
+
+import torch
+from torch import nn
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
+from torchvision.ops import nms
+from torchvision.transforms.functional import pil_to_tensor
+
+try:
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+except ImportError as exc:
+    raise ImportError(
+        "pycocotools is required. Install with: pip install pycocotools"
+    ) from exc
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
+from network import (
+    Network,
+    DPGAConfig,
+    DPGAController,
+    DPGAModulePolicy,
+    build_dpga_groups,
+    format_dpga_stats,
+    split_detection_and_odam_loss,
+    validate_config,
+)
+
+
+# =============================================================================
+# Detector configuration
+# =============================================================================
+
+
+@dataclass
+class DetectorConfig:
+    # Image normalization
+    image_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
+    image_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
+
+    # Backbone
+    backbone_freeze_at: int = 2
+
+    # Filled from dataset at runtime.
+    num_classes: int = 2
+
+    # RPN
+    rpn_channel: int = 256
+    anchor_base_size: int = 16
+    anchor_base_scale: Tuple[float, ...] = (2.0,)
+    anchor_aspect_ratios: Tuple[float, ...] = (0.5, 1.0, 2.0)
+    num_cell_anchors: int = 3
+
+    rpn_min_box_size: float = 0.0
+    rpn_nms_threshold: float = 0.7
+
+    train_prev_nms_top_n: int = 2000
+    train_post_nms_top_n: int = 1000
+    test_prev_nms_top_n: int = 1000
+    test_post_nms_top_n: int = 1000
+
+    num_sample_anchors: int = 256
+    positive_anchor_ratio: float = 0.5
+    rpn_positive_overlap: float = 0.7
+    rpn_negative_overlap: float = 0.3
+
+    rpn_bbox_normalize_targets: bool = False
+    rpn_smooth_l1_beta: float = 1.0 / 9.0
+
+    # Ignore label
+    ignore_label: int = -1
+
+    # ROI head
+    num_rois: int = 512
+    fg_ratio: float = 0.25
+    fg_threshold: float = 0.5
+    bg_threshold_high: float = 0.5
+    bg_threshold_low: float = 0.0
+
+    rcnn_bbox_normalize_targets: bool = True
+    bbox_normalize_means: Tuple[float, float, float, float] = (
+        0.0, 0.0, 0.0, 0.0
+    )
+    bbox_normalize_stds: Tuple[float, float, float, float] = (
+        0.1, 0.1, 0.2, 0.2
+    )
+    rcnn_smooth_l1_beta: float = 1.0
+
+    # Low threshold for COCO evaluation; postprocess NMS handles duplicates.
+    pred_cls_threshold: float = 0.05
+
+    # Per-process batch size; set from CLI.
+    train_batch_per_gpu: int = 1
+
+
+# =============================================================================
+# Reproducibility / distributed
+# =============================================================================
+
+
+def set_seed(seed: int, rank: int = 0):
+    seed = int(seed) + int(rank)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def init_distributed() -> Tuple[bool, int, int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+
+    if not distributed:
+        return False, 0, 1, 0
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = int(os.environ.get("RANK", "0"))
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("Distributed mode currently expects CUDA/NCCL.")
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+
+    return True, rank, world_size, local_rank
+
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
+
+
+def barrier():
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DDP) else model
+
+
+def reduce_mean(value: torch.Tensor) -> torch.Tensor:
+    if not (dist.is_available() and dist.is_initialized()):
+        return value
+
+    value = value.detach().clone()
+    dist.all_reduce(value, op=dist.ReduceOp.SUM)
+    value /= dist.get_world_size()
+    return value
+
+
+def manual_allreduce_grads(model: nn.Module):
+    """
+    DPGA uses torch.autograd.grad + direct param.grad assignment.
+    Therefore DDP's normal backward all-reduce is bypassed.
+
+    We explicitly average final gradients across ranks.
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+
+    world_size = dist.get_world_size()
+
+    for p in unwrap_model(model).parameters():
+        if p.grad is None:
+            continue
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        p.grad.div_(world_size)
+
+
+def gather_objects(obj, rank: int, world_size: int):
+    if world_size == 1:
+        return [obj]
+
+    gathered = [None for _ in range(world_size)] if rank == 0 else None
+    dist.gather_object(
+        obj,
+        object_gather_list=gathered,
+        dst=0,
+    )
+    return gathered
+
+
+class DistributedEvalSampler(Sampler):
+    """
+    Evaluation sampler without padding/duplication.
+
+    torch DistributedSampler(drop_last=False) pads indices when dataset size is
+    not divisible by world_size, which can duplicate detections and corrupt
+    COCO metrics. This sampler partitions validation indices exactly once.
+    """
+
+    def __init__(self, dataset: Dataset, rank: int, world_size: int):
+        self.dataset = dataset
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+
+    def __iter__(self):
+        return iter(
+            range(
+                self.rank,
+                len(self.dataset),
+                self.world_size,
+            )
+        )
+
+    def __len__(self):
+        n = len(self.dataset)
+        if self.rank >= n:
+            return 0
+        return (n - 1 - self.rank) // self.world_size + 1
+
+
+# =============================================================================
+# COCO Dataset
+# =============================================================================
+
+
+def _compute_resize(
+    height: int,
+    width: int,
+    min_size: int,
+    max_size: int,
+) -> Tuple[int, int]:
+    if min_size <= 0:
+        return height, width
+
+    scale = float(min_size) / float(min(height, width))
+
+    if max_size > 0 and max(height, width) * scale > max_size:
+        scale = float(max_size) / float(max(height, width))
+
+    new_h = max(1, int(round(height * scale)))
+    new_w = max(1, int(round(width * scale)))
+    return new_h, new_w
+
+
+class CocoDetectionTrainDataset(Dataset):
+    """
+    COCO JSON -> tensor format expected by the self-contained detector.
+
+    Internal class labels are remapped:
+        COCO category ids -> {1, 2, ..., K}
+    background = 0
+    ignore = -1
+    """
+
+    def __init__(
+        self,
+        image_root: str,
+        annotation_file: str,
+        min_size: int = 800,
+        max_size: int = 1333,
+    ):
+        self.image_root = Path(image_root)
+        self.coco = COCO(annotation_file)
+        self.image_ids = sorted(self.coco.getImgIds())
+
+        self.category_ids = sorted(self.coco.getCatIds())
+        self.cat_id_to_label = {
+            cat_id: idx + 1
+            for idx, cat_id in enumerate(self.category_ids)
+        }
+        self.label_to_cat_id = {
+            label: cat_id
+            for cat_id, label in self.cat_id_to_label.items()
+        }
+
+        self.min_size = int(min_size)
+        self.max_size = int(max_size)
+
+    def __len__(self):
+        return len(self.image_ids)
+
+    def __getitem__(self, index: int):
+        image_id = int(self.image_ids[index])
+        info = self.coco.loadImgs([image_id])[0]
+
+        image_path = self.image_root / info["file_name"]
+        image = Image.open(image_path).convert("RGB")
+
+        orig_w, orig_h = image.size
+
+        new_h, new_w = _compute_resize(
+            orig_h,
+            orig_w,
+            self.min_size,
+            self.max_size,
+        )
+
+        if (new_h, new_w) != (orig_h, orig_w):
+            image = image.resize(
+                (new_w, new_h),
+                resample=Image.BILINEAR,
+            )
+
+        image_tensor = pil_to_tensor(image).float() / 255.0
+
+        sx = float(new_w) / float(orig_w)
+        sy = float(new_h) / float(orig_h)
+
+        ann_ids = self.coco.getAnnIds(
+            imgIds=[image_id],
+        )
+        annotations = self.coco.loadAnns(ann_ids)
+
+        gt_rows = []
+
+        for ann in annotations:
+            if "bbox" not in ann:
+                continue
+
+            x, y, w, h = map(float, ann["bbox"])
+            if w <= 0 or h <= 0:
+                continue
+
+            x1 = x * sx
+            y1 = y * sy
+            x2 = (x + w) * sx
+            y2 = (y + h) * sy
+
+            category_id = int(ann["category_id"])
+            label = self.cat_id_to_label[category_id]
+
+            # Ignore/crowd are marked -1 for ROI target policy.
+            if int(ann.get("ignore", 0)) == 1 or int(ann.get("iscrowd", 0)) == 1:
+                label = -1
+
+            gt_rows.append(
+                [x1, y1, x2, y2, float(label)]
+            )
+
+        if gt_rows:
+            gt_boxes = torch.tensor(
+                gt_rows,
+                dtype=torch.float32,
+            )
+        else:
+            gt_boxes = torch.zeros(
+                (0, 5),
+                dtype=torch.float32,
+            )
+
+        meta = {
+            "image_id": image_id,
+            "orig_h": orig_h,
+            "orig_w": orig_w,
+            "resized_h": new_h,
+            "resized_w": new_w,
+            "scale_x": sx,
+            "scale_y": sy,
+        }
+
+        return image_tensor, gt_boxes, meta
+
+
+def detection_collate(batch):
+    """
+    Pads image tensors to same H/W within a batch.
+
+    Network will additionally pad H/W to multiple of 64.
+    """
+    images, gt_list, meta_list = zip(*batch)
+
+    batch_size = len(images)
+    channels = images[0].shape[0]
+    max_h = max(img.shape[1] for img in images)
+    max_w = max(img.shape[2] for img in images)
+
+    image_batch = images[0].new_zeros(
+        (batch_size, channels, max_h, max_w)
+    )
+
+    for i, image in enumerate(images):
+        h, w = image.shape[-2:]
+        image_batch[i, :, :h, :w] = image
+
+    max_gt = max(max(gt.shape[0] for gt in gt_list), 1)
+    gt_batch = images[0].new_zeros(
+        (batch_size, max_gt, 5)
+    )
+
+    im_info = images[0].new_zeros(
+        (batch_size, 6)
+    )
+
+    for i, (gt, meta) in enumerate(zip(gt_list, meta_list)):
+        if gt.shape[0] > 0:
+            gt_batch[i, :gt.shape[0]] = gt
+
+        # Fields used by detector:
+        # 0 = resized height
+        # 1 = resized width
+        # 2 = scale
+        # 5 = number GT
+        im_info[i, 0] = float(meta["resized_h"])
+        im_info[i, 1] = float(meta["resized_w"])
+        im_info[i, 2] = float(
+            (meta["scale_x"] + meta["scale_y"]) * 0.5
+        )
+        im_info[i, 3] = float(meta["orig_h"])
+        im_info[i, 4] = float(meta["orig_w"])
+        im_info[i, 5] = float(gt.shape[0])
+
+    return image_batch, im_info, gt_batch, list(meta_list)
+
+
+# =============================================================================
+# Post-processing
+# =============================================================================
+
+
+@torch.no_grad()
+def postprocess_single_image(
+    pred: torch.Tensor,
+    meta: Dict,
+    label_to_cat_id: Dict[int, int],
+    score_threshold: float,
+    nms_threshold: float,
+    max_detections: int,
+) -> List[Dict]:
+    """
+    pred columns:
+        [x1, y1, x2, y2, score, internal_class, ...optional DAM]
+    """
+    if pred.numel() == 0:
+        return []
+
+    pred = pred[:, :6]
+    pred = pred[
+        torch.isfinite(pred).all(dim=1)
+    ]
+
+    if pred.numel() == 0:
+        return []
+
+    boxes = pred[:, :4]
+    scores = pred[:, 4]
+    labels = pred[:, 5].long()
+
+    keep_score = scores >= float(score_threshold)
+    boxes = boxes[keep_score]
+    scores = scores[keep_score]
+    labels = labels[keep_score]
+
+    if boxes.numel() == 0:
+        return []
+
+    # Clip in resized-image coordinates.
+    rh = float(meta["resized_h"])
+    rw = float(meta["resized_w"])
+
+    boxes[:, 0::2].clamp_(min=0, max=max(rw - 1, 0))
+    boxes[:, 1::2].clamp_(min=0, max=max(rh - 1, 0))
+
+    keep_all = []
+
+    for cls in labels.unique():
+        cls_inds = torch.nonzero(
+            labels == cls,
+            as_tuple=False,
+        ).squeeze(1)
+
+        cls_keep = nms(
+            boxes[cls_inds],
+            scores[cls_inds],
+            float(nms_threshold),
+        )
+
+        keep_all.append(cls_inds[cls_keep])
+
+    if not keep_all:
+        return []
+
+    keep = torch.cat(keep_all, dim=0)
+
+    # Global top-k after per-class NMS.
+    keep = keep[
+        scores[keep].argsort(descending=True)
+    ][: int(max_detections)]
+
+    boxes = boxes[keep]
+    scores = scores[keep]
+    labels = labels[keep]
+
+    sx = float(meta["scale_x"])
+    sy = float(meta["scale_y"])
+
+    boxes = boxes.clone()
+    boxes[:, [0, 2]] /= sx
+    boxes[:, [1, 3]] /= sy
+
+    oh = float(meta["orig_h"])
+    ow = float(meta["orig_w"])
+
+    boxes[:, 0::2].clamp_(min=0, max=max(ow - 1, 0))
+    boxes[:, 1::2].clamp_(min=0, max=max(oh - 1, 0))
+
+    output = []
+
+    for box, score, label in zip(boxes, scores, labels):
+        x1, y1, x2, y2 = map(float, box.tolist())
+
+        w = max(0.0, x2 - x1)
+        h = max(0.0, y2 - y1)
+
+        internal_label = int(label.item())
+        if internal_label not in label_to_cat_id:
+            continue
+
+        output.append(
+            {
+                "image_id": int(meta["image_id"]),
+                "category_id": int(
+                    label_to_cat_id[internal_label]
+                ),
+                "bbox": [x1, y1, w, h],
+                "score": float(score.item()),
+            }
+        )
+
+    return output
+
+
+# =============================================================================
+# Metrics
+# =============================================================================
+
+
+def evaluate_coco(
+    coco_gt: COCO,
+    predictions: List[Dict],
+    image_ids: Sequence[int],
+) -> Dict[str, float]:
+    if len(predictions) == 0:
+        return {
+            "AP": 0.0,
+            "AP50": 0.0,
+            "AP75": 0.0,
+            "AP_small": 0.0,
+            "AP_medium": 0.0,
+            "AP_large": 0.0,
+            "AR1": 0.0,
+            "AR10": 0.0,
+            "AR100": 0.0,
+        }
+
+    coco_dt = coco_gt.loadRes(predictions)
+
+    evaluator = COCOeval(
+        coco_gt,
+        coco_dt,
+        iouType="bbox",
+    )
+
+    evaluator.params.imgIds = list(map(int, image_ids))
+
+    evaluator.evaluate()
+    evaluator.accumulate()
+    evaluator.summarize()
+
+    s = evaluator.stats
+
+    return {
+        "AP": float(s[0]),
+        "AP50": float(s[1]),
+        "AP75": float(s[2]),
+        "AP_small": float(s[3]),
+        "AP_medium": float(s[4]),
+        "AP_large": float(s[5]),
+        "AR1": float(s[6]),
+        "AR10": float(s[7]),
+        "AR100": float(s[8]),
+    }
+
+
+def _xywh_to_xyxy(box):
+    x, y, w, h = map(float, box)
+    return np.array(
+        [x, y, x + w, y + h],
+        dtype=np.float64,
+    )
+
+
+def _iou_numpy(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
+    if boxes.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float64)
+
+    x1 = np.maximum(box[0], boxes[:, 0])
+    y1 = np.maximum(box[1], boxes[:, 1])
+    x2 = np.minimum(box[2], boxes[:, 2])
+    y2 = np.minimum(box[3], boxes[:, 3])
+
+    iw = np.maximum(0.0, x2 - x1)
+    ih = np.maximum(0.0, y2 - y1)
+    inter = iw * ih
+
+    area_a = max(0.0, box[2] - box[0]) * max(
+        0.0, box[3] - box[1]
+    )
+    area_b = np.maximum(
+        0.0,
+        boxes[:, 2] - boxes[:, 0],
+    ) * np.maximum(
+        0.0,
+        boxes[:, 3] - boxes[:, 1],
+    )
+
+    union = area_a + area_b - inter
+    return inter / np.maximum(union, 1e-12)
+
+
+def compute_generic_mr2(
+    coco_gt: COCO,
+    predictions: List[Dict],
+    category_id: int,
+    image_ids: Sequence[int],
+    iou_threshold: float = 0.5,
+) -> float:
+    """
+    Generic log-average miss rate at FPPI = 10^-2 ... 10^0.
+
+    This is useful as a sanity metric for single-class pedestrian detection,
+    but is NOT the full official CityPersons Reasonable protocol.
+    """
+    gt_by_image: Dict[int, np.ndarray] = {}
+    matched_by_image: Dict[int, np.ndarray] = {}
+
+    total_gt = 0
+
+    for image_id in image_ids:
+        ann_ids = coco_gt.getAnnIds(
+            imgIds=[int(image_id)],
+            catIds=[int(category_id)],
+            iscrowd=False,
+        )
+        anns = coco_gt.loadAnns(ann_ids)
+
+        boxes = [
+            _xywh_to_xyxy(ann["bbox"])
+            for ann in anns
+            if int(ann.get("ignore", 0)) == 0
+        ]
+
+        if boxes:
+            arr = np.stack(boxes, axis=0)
+        else:
+            arr = np.zeros((0, 4), dtype=np.float64)
+
+        gt_by_image[int(image_id)] = arr
+        matched_by_image[int(image_id)] = np.zeros(
+            (arr.shape[0],),
+            dtype=bool,
+        )
+        total_gt += arr.shape[0]
+
+    if total_gt == 0:
+        return float("nan")
+
+    dets = [
+        pred
+        for pred in predictions
+        if int(pred["category_id"]) == int(category_id)
+    ]
+    dets.sort(
+        key=lambda x: float(x["score"]),
+        reverse=True,
+    )
+
+    tp = []
+    fp = []
+
+    for det in dets:
+        image_id = int(det["image_id"])
+        det_box = _xywh_to_xyxy(det["bbox"])
+
+        gt_boxes = gt_by_image.get(
+            image_id,
+            np.zeros((0, 4), dtype=np.float64),
+        )
+        matched = matched_by_image.get(
+            image_id,
+            np.zeros((0,), dtype=bool),
+        )
+
+        if gt_boxes.shape[0] == 0:
+            tp.append(0.0)
+            fp.append(1.0)
+            continue
+
+        ious = _iou_numpy(
+            det_box,
+            gt_boxes,
+        )
+
+        # Do not rematch already matched GT.
+        ious[matched] = -1.0
+
+        best = int(np.argmax(ious))
+        best_iou = float(ious[best])
+
+        if best_iou >= iou_threshold:
+            matched[best] = True
+            tp.append(1.0)
+            fp.append(0.0)
+        else:
+            tp.append(0.0)
+            fp.append(1.0)
+
+    if len(tp) == 0:
+        return 1.0
+
+    tp = np.cumsum(np.asarray(tp, dtype=np.float64))
+    fp = np.cumsum(np.asarray(fp, dtype=np.float64))
+
+    miss_rate = 1.0 - tp / float(total_gt)
+    fppi = fp / float(max(len(image_ids), 1))
+
+    refs = np.logspace(-2.0, 0.0, 9)
+    sampled_miss = []
+
+    for ref in refs:
+        valid = np.where(fppi <= ref)[0]
+        if len(valid) == 0:
+            sampled_miss.append(1.0)
+        else:
+            sampled_miss.append(
+                float(miss_rate[valid[-1]])
+            )
+
+    sampled_miss = np.clip(
+        np.asarray(sampled_miss, dtype=np.float64),
+        1e-10,
+        1.0,
+    )
+
+    return float(
+        np.exp(np.mean(np.log(sampled_miss)))
+    )
+
+
+# =============================================================================
+# Validation
+# =============================================================================
+
+
+def validate(
+    model: nn.Module,
+    loader: DataLoader,
+    dataset: CocoDetectionTrainDataset,
+    device: torch.device,
+    args,
+    rank: int,
+    world_size: int,
+    output_dir: Path,
+    epoch: int,
+) -> Dict[str, float]:
+    model.eval()
+    unwrap_model(model).set_odam_inference(False)
+
+    predictions_local: List[Dict] = []
+    image_ids_local: List[int] = []
+
+    iterator = loader
+    if tqdm is not None and rank == 0:
+        iterator = tqdm(
+            loader,
+            desc=f"val {epoch:03d}",
+            leave=False,
+        )
+
+    # Fast detection-only inference does not require gradients.
+    with torch.no_grad():
+        for image, im_info, _, metas in iterator:
+            image = image.to(
+                device,
+                non_blocking=True,
+            )
+            im_info = im_info.to(
+                device,
+                non_blocking=True,
+            )
+
+            pred = model(
+                image,
+                im_info,
+            )
+
+            # Current Network returns concatenated batch predictions only through
+            # rcnn_rois. With batch_size=1 val this is unambiguous.
+            # We enforce val batch size 1 below.
+            if len(metas) != 1:
+                raise RuntimeError(
+                    "Validation currently requires --val-batch-size=1 "
+                    "because RCNN output has no explicit batch column."
+                )
+
+            meta = metas[0]
+
+            pred_list = postprocess_single_image(
+                pred,
+                meta=meta,
+                label_to_cat_id=dataset.label_to_cat_id,
+                score_threshold=args.eval_score_threshold,
+                nms_threshold=args.eval_nms,
+                max_detections=args.max_detections,
+            )
+
+            predictions_local.extend(pred_list)
+            image_ids_local.append(
+                int(meta["image_id"])
+            )
+
+    gathered_predictions = gather_objects(
+        predictions_local,
+        rank,
+        world_size,
+    )
+    gathered_ids = gather_objects(
+        image_ids_local,
+        rank,
+        world_size,
+    )
+
+    if rank != 0:
+        return {}
+
+    predictions = []
+    image_ids = []
+
+    for part in gathered_predictions:
+        predictions.extend(part)
+
+    for part in gathered_ids:
+        image_ids.extend(part)
+
+    image_ids = sorted(set(image_ids))
+
+    metrics = evaluate_coco(
+        dataset.coco,
+        predictions,
+        image_ids,
+    )
+
+    if len(dataset.category_ids) == 1:
+        metrics["MR-2_generic"] = compute_generic_mr2(
+            dataset.coco,
+            predictions,
+            category_id=dataset.category_ids[0],
+            image_ids=image_ids,
+            iou_threshold=0.5,
+        )
+
+    pred_file = output_dir / f"predictions_epoch_{epoch:03d}.json"
+    pred_file.write_text(
+        json.dumps(predictions),
+        encoding="utf-8",
+    )
+
+    return metrics
+
+
+# =============================================================================
+# Training
+# =============================================================================
+
+
+def make_dpga_config(args) -> DPGAConfig:
+    return DPGAConfig(
+        warmup_epochs=args.dpga_warmup,
+        rampup_epochs=args.dpga_rampup,
+        alpha_max=args.dpga_alpha,
+        project_if_conflict=True,
+        conflict_threshold=0.0,
+        module_policies={
+            "backbone": DPGAModulePolicy(
+                rho=args.rho_backbone,
+                tau=0.0,
+                temperature=args.dpga_temperature,
+            ),
+            "fpn": DPGAModulePolicy(
+                rho=args.rho_fpn,
+                tau=0.0,
+                temperature=args.dpga_temperature,
+            ),
+            "rpn": DPGAModulePolicy(
+                rho=args.rho_rpn,
+                tau=0.0,
+                temperature=args.dpga_temperature,
+            ),
+            "roi_shared": DPGAModulePolicy(
+                rho=args.rho_roi_shared,
+                tau=0.0,
+                temperature=args.dpga_temperature,
+            ),
+            "roi_cls": DPGAModulePolicy(
+                rho=args.rho_roi_cls,
+                tau=0.0,
+                temperature=args.dpga_temperature,
+            ),
+            "roi_reg": DPGAModulePolicy(
+                rho=args.rho_roi_reg,
+                tau=0.0,
+                temperature=args.dpga_temperature,
+            ),
+        },
+    )
+
+
+def build_optimizer(model: nn.Module, args):
+    params = [
+        p for p in unwrap_model(model).parameters()
+        if p.requires_grad
+    ]
+
+    return torch.optim.SGD(
+        params,
+        lr=args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
+    )
+
+
+def build_scheduler(optimizer, args):
+    return torch.optim.lr_scheduler.MultiStepLR(
+        optimizer,
+        milestones=list(args.lr_steps),
+        gamma=args.lr_gamma,
+    )
+
+
+def load_initial_weights(
+    model: nn.Module,
+    checkpoint_path: Optional[str],
+):
+    if not checkpoint_path:
+        return
+
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+    )
+
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        state = checkpoint["model"]
+    else:
+        state = checkpoint
+
+    missing, unexpected = unwrap_model(model).load_state_dict(
+        state,
+        strict=False,
+    )
+
+    print(
+        f"[init] loaded {checkpoint_path}; "
+        f"missing={len(missing)}, unexpected={len(unexpected)}"
+    )
+
+
+def save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer,
+    scheduler,
+    epoch: int,
+    method: str,
+    detector_config: DetectorConfig,
+    args,
+    metrics: Dict[str, float],
+):
+    torch.save(
+        {
+            "epoch": epoch,
+            "method": method,
+            "model": unwrap_model(model).state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "detector_config": asdict(detector_config),
+            "args": vars(args),
+            "metrics": metrics,
+        },
+        path,
+    )
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer,
+    dpga: Optional[DPGAController],
+    device: torch.device,
+    output_dir: Path,
+    args,
+    epoch: int,
+    rank: int,
+) -> Dict[str, float]:
+    model.train()
+
+    raw_model = unwrap_model(model)
+
+    if args.method == "baseline":
+        raw_model.set_odam_enabled(False)
+    else:
+        raw_model.set_odam_enabled(True)
+
+    totals = {
+        "loss_det": 0.0,
+        "loss_odam": 0.0,
+        "loss_total_objective": 0.0,
+    }
+
+    num_steps = 0
+
+    iterator = loader
+    if tqdm is not None and rank == 0:
+        iterator = tqdm(
+            loader,
+            desc=f"train {epoch:03d}",
+            leave=False,
+        )
+
+    for step, (image, im_info, gt_boxes, _) in enumerate(iterator):
+        image = image.to(
+            device,
+            non_blocking=True,
+        )
+        im_info = im_info.to(
+            device,
+            non_blocking=True,
+        )
+        gt_boxes = gt_boxes.to(
+            device,
+            non_blocking=True,
+        )
+
+        optimizer.zero_grad(set_to_none=True)
+        diagnostic_rows = []
+        dpga_stats = None
+
+        if args.method == "dpga" and isinstance(model, DDP):
+            sync_context = model.no_sync()
+        else:
+            sync_context = nullcontext()
+
+        with sync_context:
+            loss_dict = model(
+                image,
+                im_info,
+                gt_boxes,
+            )
+
+            loss_det, loss_odam = split_detection_and_odam_loss(
+                loss_dict
+            )
+
+            if args.method == "baseline":
+                objective = loss_det
+                objective.backward()
+
+            elif args.method == "odam":
+                objective = (
+                    loss_det
+                    + args.odam_weight * loss_odam
+                )
+                if should_log_gradient_diagnostics(args, step):
+                    diagnostic_rows = compute_odam_gradient_diagnostics(
+                        model=model,
+                        loss_det=loss_det,
+                        loss_odam=loss_odam,
+                        odam_weight=args.odam_weight,
+                        epoch=epoch,
+                        step=step,
+                        rank=rank,
+                    )
+                objective.backward()
+
+            elif args.method == "dpga":
+                if dpga is None:
+                    raise RuntimeError("DPGA controller not initialized")
+
+                dpga_stats = dpga.backward(
+                    loss_det=loss_det,
+                    loss_odam=loss_odam,
+                    epoch=float(epoch),
+                )
+
+                # For logging only; NOT used for backward.
+                objective = loss_det + loss_odam
+                if should_log_gradient_diagnostics(args, step):
+                    diagnostic_rows = dpga_stats_to_diagnostic_rows(
+                        stats=dpga_stats,
+                        loss_det=loss_det,
+                        loss_odam=loss_odam,
+                        epoch=epoch,
+                        step=step,
+                        rank=rank,
+                    )
+
+            else:
+                raise ValueError(args.method)
+
+        if args.method == "dpga":
+            manual_allreduce_grads(model)
+
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                raw_model.parameters(),
+                max_norm=args.grad_clip,
+            )
+
+        optimizer.step()
+        append_gradient_diagnostics(
+            output_dir,
+            diagnostic_rows,
+            rank,
+        )
+
+        loss_det_reduced = reduce_mean(
+            loss_det.detach()
+        )
+        loss_odam_reduced = reduce_mean(
+            loss_odam.detach()
+        )
+        objective_reduced = reduce_mean(
+            objective.detach()
+        )
+
+        totals["loss_det"] += float(
+            loss_det_reduced.cpu()
+        )
+        totals["loss_odam"] += float(
+            loss_odam_reduced.cpu()
+        )
+        totals["loss_total_objective"] += float(
+            objective_reduced.cpu()
+        )
+        num_steps += 1
+
+        if rank == 0 and tqdm is not None:
+            iterator.set_postfix(
+                det=f"{float(loss_det_reduced):.3f}",
+                odam=f"{float(loss_odam_reduced):.3f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+            )
+
+        if (
+            rank == 0
+            and args.method == "dpga"
+            and args.dpga_log_interval > 0
+            and step % args.dpga_log_interval == 0
+        ):
+            print(format_dpga_stats(dpga_stats))
+
+    denom = max(num_steps, 1)
+
+    return {
+        key: value / denom
+        for key, value in totals.items()
+    }
+
+
+CSV_FIELDS = [
+    "epoch",
+    "method",
+    "lr",
+    "seconds",
+    "loss_det",
+    "loss_odam",
+    "loss_total_objective",
+    "AP",
+    "AP50",
+    "AP75",
+    "AP_small",
+    "AP_medium",
+    "AP_large",
+    "AR1",
+    "AR10",
+    "AR100",
+    "MR-2_generic",
+]
+
+
+GRADIENT_DIAGNOSTIC_FIELDS = [
+    "epoch",
+    "step",
+    "rank",
+    "method",
+    "module",
+    "loss_det",
+    "loss_odam",
+    "cosine_raw",
+    "det_norm",
+    "odam_norm_raw",
+    "odam_norm_safe",
+    "aux_to_det_raw",
+    "aux_to_det_effective",
+    "directional_margin",
+    "final_cosine_to_det",
+    "final_angle_deg",
+    "conflict_raw",
+    "dominance_raw",
+    "dominance_effective",
+    "unsafe_descent",
+    "projected",
+    "cap_active",
+    "norm_scale",
+    "gate",
+    "alpha",
+    "effective_weight",
+]
+
+
+def append_csv_fields(
+    csv_path: Path,
+    row: Dict,
+    fields: Sequence[str],
+):
+    csv_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    exists = csv_path.exists()
+
+    normalized = {
+        field: row.get(field, "")
+        for field in fields
+    }
+
+    with csv_path.open(
+        "a",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fields,
+        )
+
+        if not exists:
+            writer.writeheader()
+
+        writer.writerow(normalized)
+
+
+def append_csv(
+    csv_path: Path,
+    row: Dict,
+):
+    append_csv_fields(
+        csv_path,
+        row,
+        CSV_FIELDS,
+    )
+
+
+def should_log_gradient_diagnostics(args, step: int) -> bool:
+    interval = int(args.gradient_diagnostics_interval)
+    return (
+        args.method in ("odam", "dpga")
+        and interval > 0
+        and step % interval == 0
+    )
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    if not math.isfinite(numerator) or not math.isfinite(denominator):
+        return 0.0
+    if abs(denominator) <= 1e-12:
+        return 0.0
+    return numerator / denominator
+
+
+def _final_angle_degrees(cosine: float) -> float:
+    cosine = min(max(float(cosine), -1.0), 1.0)
+    return math.degrees(math.acos(cosine))
+
+
+def _tensor_list_dot(
+    xs: Sequence[torch.Tensor],
+    ys: Sequence[torch.Tensor],
+) -> torch.Tensor:
+    if not xs:
+        return torch.tensor(0.0)
+
+    out = xs[0].new_zeros(())
+    for x, y in zip(xs, ys):
+        out = out + torch.sum(x * y)
+    return out
+
+
+def _tensor_list_norm(xs: Sequence[torch.Tensor]) -> torch.Tensor:
+    if not xs:
+        return torch.tensor(0.0)
+
+    out = xs[0].new_zeros(())
+    for x in xs:
+        out = out + torch.sum(x * x)
+    return torch.sqrt(out)
+
+
+def _replace_none_grads(
+    grads: Sequence[Optional[torch.Tensor]],
+    params: Sequence[nn.Parameter],
+) -> List[torch.Tensor]:
+    return [
+        torch.zeros_like(param, memory_format=torch.preserve_format)
+        if grad is None else grad
+        for param, grad in zip(params, grads)
+    ]
+
+
+def compute_odam_gradient_diagnostics(
+    model: nn.Module,
+    loss_det: torch.Tensor,
+    loss_odam: torch.Tensor,
+    odam_weight: float,
+    epoch: int,
+    step: int,
+    rank: int,
+) -> List[Dict]:
+    raw_model = unwrap_model(model)
+    groups = build_dpga_groups(raw_model)
+
+    params = [
+        param
+        for group_params in groups.values()
+        for param in group_params
+    ]
+
+    g_det_raw = torch.autograd.grad(
+        loss_det,
+        params,
+        retain_graph=True,
+        create_graph=False,
+        allow_unused=True,
+    )
+    g_odam_raw = torch.autograd.grad(
+        loss_odam,
+        params,
+        retain_graph=True,
+        create_graph=False,
+        allow_unused=True,
+    )
+
+    g_det_flat = _replace_none_grads(
+        g_det_raw,
+        params,
+    )
+    g_odam_flat = _replace_none_grads(
+        g_odam_raw,
+        params,
+    )
+
+    rows = []
+    offset = 0
+
+    for module_name, module_params in groups.items():
+        size = len(module_params)
+        g_det = g_det_flat[offset: offset + size]
+        g_odam = g_odam_flat[offset: offset + size]
+        offset += size
+
+        det_norm_t = _tensor_list_norm(g_det)
+        odam_norm_t = _tensor_list_norm(g_odam)
+        dot_t = _tensor_list_dot(g_det, g_odam)
+        final_grads = [
+            gd + float(odam_weight) * go
+            for gd, go in zip(g_det, g_odam)
+        ]
+        final_norm_t = _tensor_list_norm(final_grads)
+        final_dot_t = _tensor_list_dot(g_det, final_grads)
+
+        det_norm = float(det_norm_t.detach().cpu())
+        odam_norm = float(odam_norm_t.detach().cpu())
+        dot = float(dot_t.detach().cpu())
+        final_norm = float(final_norm_t.detach().cpu())
+        final_dot = float(final_dot_t.detach().cpu())
+
+        cosine_raw = _safe_ratio(
+            dot,
+            det_norm * odam_norm,
+        )
+        final_cosine = _safe_ratio(
+            final_dot,
+            det_norm * final_norm,
+        )
+        aux_effective_norm = abs(float(odam_weight)) * odam_norm
+        directional_margin = _safe_ratio(
+            final_dot,
+            det_norm * det_norm,
+        )
+
+        rows.append(
+            {
+                "epoch": epoch,
+                "step": step,
+                "rank": rank,
+                "method": "odam",
+                "module": module_name,
+                "loss_det": float(loss_det.detach().cpu()),
+                "loss_odam": float(loss_odam.detach().cpu()),
+                "cosine_raw": cosine_raw,
+                "det_norm": det_norm,
+                "odam_norm_raw": odam_norm,
+                "odam_norm_safe": odam_norm,
+                "aux_to_det_raw": _safe_ratio(odam_norm, det_norm),
+                "aux_to_det_effective": _safe_ratio(
+                    aux_effective_norm,
+                    det_norm,
+                ),
+                "directional_margin": directional_margin,
+                "final_cosine_to_det": final_cosine,
+                "final_angle_deg": _final_angle_degrees(final_cosine),
+                "conflict_raw": int(cosine_raw < 0.0),
+                "dominance_raw": int(odam_norm > det_norm),
+                "dominance_effective": int(aux_effective_norm > det_norm),
+                "unsafe_descent": int(directional_margin <= 0.0),
+                "projected": 0,
+                "cap_active": 0,
+                "norm_scale": 1.0,
+                "gate": 1.0,
+                "alpha": float(odam_weight),
+                "effective_weight": float(odam_weight),
+            }
+        )
+
+    return rows
+
+
+def dpga_stats_to_diagnostic_rows(
+    stats,
+    loss_det: torch.Tensor,
+    loss_odam: torch.Tensor,
+    epoch: int,
+    step: int,
+    rank: int,
+) -> List[Dict]:
+    rows = []
+
+    for module_name, module_stats in stats.modules.items():
+        det_norm = float(module_stats.det_norm)
+        odam_norm_raw = float(module_stats.odam_norm_before)
+        odam_norm_safe = float(module_stats.odam_norm_after_cap)
+        effective_aux_norm = (
+            abs(float(module_stats.effective_weight))
+            * odam_norm_safe
+        )
+        raw_aux_ratio = _safe_ratio(odam_norm_raw, det_norm)
+        effective_aux_ratio = _safe_ratio(effective_aux_norm, det_norm)
+
+        final_dot = (
+            det_norm * det_norm
+            + float(module_stats.effective_weight)
+            * float(module_stats.cosine_after)
+            * det_norm
+            * odam_norm_safe
+        )
+        directional_margin = _safe_ratio(
+            final_dot,
+            det_norm * det_norm,
+        )
+        final_cosine = _safe_ratio(
+            final_dot,
+            det_norm * float(module_stats.final_norm),
+        )
+
+        rows.append(
+            {
+                "epoch": epoch,
+                "step": step,
+                "rank": rank,
+                "method": "dpga",
+                "module": module_name,
+                "loss_det": float(loss_det.detach().cpu()),
+                "loss_odam": float(loss_odam.detach().cpu()),
+                "cosine_raw": float(module_stats.cosine_before),
+                "det_norm": det_norm,
+                "odam_norm_raw": odam_norm_raw,
+                "odam_norm_safe": odam_norm_safe,
+                "aux_to_det_raw": raw_aux_ratio,
+                "aux_to_det_effective": effective_aux_ratio,
+                "directional_margin": directional_margin,
+                "final_cosine_to_det": final_cosine,
+                "final_angle_deg": _final_angle_degrees(final_cosine),
+                "conflict_raw": int(module_stats.cosine_before < 0.0),
+                "dominance_raw": int(odam_norm_raw > det_norm),
+                "dominance_effective": int(effective_aux_norm > det_norm),
+                "unsafe_descent": int(directional_margin <= 0.0),
+                "projected": int(module_stats.projected),
+                "cap_active": int(
+                    odam_norm_safe
+                    < float(module_stats.odam_norm_after_projection)
+                ),
+                "norm_scale": float(module_stats.norm_scale),
+                "gate": float(module_stats.gate),
+                "alpha": float(module_stats.alpha),
+                "effective_weight": float(module_stats.effective_weight),
+            }
+        )
+
+    return rows
+
+
+def append_gradient_diagnostics(
+    output_dir: Path,
+    rows: Sequence[Dict],
+    rank: int,
+):
+    if not rows:
+        return
+
+    csv_path = output_dir / f"gradient_diagnostics_rank{rank}.csv"
+    for row in rows:
+        append_csv_fields(
+            csv_path,
+            row,
+            GRADIENT_DIAGNOSTIC_FIELDS,
+        )
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train Faster R-CNN / ODAM / DPGA-ODAM"
+    )
+
+    parser.add_argument(
+        "--method",
+        choices=("baseline", "odam", "dpga"),
+        required=True,
+    )
+
+    parser.add_argument("--train-images", required=True)
+    parser.add_argument("--train-ann", required=True)
+    parser.add_argument("--val-images", required=True)
+    parser.add_argument("--val-ann", required=True)
+
+    parser.add_argument(
+        "--output",
+        type=str,
+        required=True,
+    )
+
+    # Image size
+    parser.add_argument("--min-size", type=int, default=800)
+    parser.add_argument("--max-size", type=int, default=1333)
+
+    # Loader
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--val-batch-size", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=4)
+
+    # Train
+    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--lr", type=float, default=0.0025)
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--lr-steps",
+        nargs="+",
+        type=int,
+        default=[8, 11],
+    )
+    parser.add_argument("--lr-gamma", type=float, default=0.1)
+    parser.add_argument("--grad-clip", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument(
+        "--init-checkpoint",
+        type=str,
+        default=None,
+        help="Same initialization checkpoint should be used for all 3 methods.",
+    )
+
+    # Original ODAM scalarization
+    parser.add_argument(
+        "--odam-weight",
+        type=float,
+        default=0.2,
+    )
+
+    # DPGA schedule
+    parser.add_argument("--dpga-warmup", type=int, default=4)
+    parser.add_argument("--dpga-rampup", type=int, default=4)
+    parser.add_argument("--dpga-alpha", type=float, default=1.0)
+    parser.add_argument(
+        "--dpga-temperature",
+        type=float,
+        default=0.20,
+    )
+
+    # Module-wise norm caps
+    parser.add_argument("--rho-backbone", type=float, default=0.10)
+    parser.add_argument("--rho-fpn", type=float, default=0.15)
+    parser.add_argument("--rho-rpn", type=float, default=0.00)
+    parser.add_argument("--rho-roi-shared", type=float, default=0.25)
+    parser.add_argument("--rho-roi-cls", type=float, default=0.10)
+    parser.add_argument("--rho-roi-reg", type=float, default=0.05)
+
+    parser.add_argument(
+        "--dpga-log-interval",
+        type=int,
+        default=100,
+    )
+    parser.add_argument(
+        "--gradient-diagnostics-interval",
+        type=int,
+        default=100,
+        help=(
+            "Write gradient_diagnostics_rank*.csv every N train steps for "
+            "ODAM/DPGA. Set 0 to disable."
+        ),
+    )
+
+    # Evaluation
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--eval-score-threshold",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
+        "--eval-nms",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--max-detections",
+        type=int,
+        default=100,
+    )
+    parser.add_argument(
+        "--best-metric",
+        choices=("AP", "AP50", "AP75", "MR-2_generic"),
+        default="AP",
+    )
+
+    return parser.parse_args()
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+
+def main():
+    args = parse_args()
+
+    distributed, rank, world_size, local_rank = init_distributed()
+
+    set_seed(
+        args.seed,
+        rank=rank,
+    )
+
+    if torch.cuda.is_available():
+        if distributed:
+            device = torch.device(
+                "cuda",
+                local_rank,
+            )
+        else:
+            device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    output_dir = Path(args.output)
+
+    if is_main_process(rank):
+        output_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    barrier()
+
+    train_dataset = CocoDetectionTrainDataset(
+        args.train_images,
+        args.train_ann,
+        min_size=args.min_size,
+        max_size=args.max_size,
+    )
+
+    val_dataset = CocoDetectionTrainDataset(
+        args.val_images,
+        args.val_ann,
+        min_size=args.min_size,
+        max_size=args.max_size,
+    )
+
+    if train_dataset.category_ids != val_dataset.category_ids:
+        raise ValueError(
+            "Train and val category IDs do not match."
+        )
+
+    if args.val_batch_size != 1:
+        raise ValueError(
+            "Current evaluator requires --val-batch-size 1."
+        )
+
+    train_sampler = (
+        DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=True,
+        )
+        if distributed
+        else None
+    )
+
+    val_sampler = (
+        DistributedEvalSampler(
+            val_dataset,
+            rank=rank,
+            world_size=world_size,
+        )
+        if distributed
+        else None
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        num_workers=args.workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=True,
+        collate_fn=detection_collate,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=args.workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+        collate_fn=detection_collate,
+    )
+
+    config = DetectorConfig(
+        num_classes=len(train_dataset.category_ids) + 1,
+        train_batch_per_gpu=args.batch_size,
+    )
+    validate_config(config)
+
+    model = Network(config)
+    model.to(device)
+
+    load_initial_weights(
+        model,
+        args.init_checkpoint,
+    )
+
+    if distributed:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
+
+    raw_model = unwrap_model(model)
+
+    # Important for a true Faster R-CNN baseline.
+    raw_model.set_odam_enabled(
+        args.method != "baseline"
+    )
+    raw_model.set_odam_inference(False)
+
+    optimizer = build_optimizer(
+        model,
+        args,
+    )
+    scheduler = build_scheduler(
+        optimizer,
+        args,
+    )
+
+    dpga = None
+    if args.method == "dpga":
+        dpga = DPGAController(
+            raw_model,
+            make_dpga_config(args),
+        )
+
+    if is_main_process(rank):
+        experiment_meta = {
+            "method": args.method,
+            "world_size": world_size,
+            "device": str(device),
+            "categories": train_dataset.category_ids,
+            "internal_label_mapping": train_dataset.cat_id_to_label,
+            "detector_config": asdict(config),
+            "args": vars(args),
+            "metric_note": (
+                "MR-2_generic is not the full official CityPersons "
+                "Reasonable protocol."
+            ),
+        }
+
+        (output_dir / "experiment.json").write_text(
+            json.dumps(
+                experiment_meta,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    best_value = (
+        float("inf")
+        if args.best_metric == "MR-2_generic"
+        else -float("inf")
+    )
+
+    csv_path = output_dir / "metrics.csv"
+
+    for epoch in range(args.epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        start = time.time()
+
+        train_metrics = train_one_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            dpga=dpga,
+            device=device,
+            output_dir=output_dir,
+            args=args,
+            epoch=epoch,
+            rank=rank,
+        )
+
+        scheduler.step()
+
+        do_eval = (
+            (epoch + 1) % args.eval_every == 0
+            or epoch == args.epochs - 1
+        )
+
+        val_metrics = {}
+
+        if do_eval:
+            val_metrics = validate(
+                model=model,
+                loader=val_loader,
+                dataset=val_dataset,
+                device=device,
+                args=args,
+                rank=rank,
+                world_size=world_size,
+                output_dir=output_dir,
+                epoch=epoch,
+            )
+
+        barrier()
+
+        if is_main_process(rank):
+            elapsed = time.time() - start
+
+            row = {
+                "epoch": epoch,
+                "method": args.method,
+                "lr": optimizer.param_groups[0]["lr"],
+                "seconds": elapsed,
+                **train_metrics,
+                **val_metrics,
+            }
+
+            append_csv(
+                csv_path,
+                row,
+            )
+
+            print(
+                f"\nEpoch {epoch}/{args.epochs - 1} "
+                f"| method={args.method} "
+                f"| det_loss={train_metrics['loss_det']:.4f} "
+                f"| odam_loss={train_metrics['loss_odam']:.4f}"
+            )
+
+            if val_metrics:
+                print(
+                    " | ".join(
+                        f"{k}={v:.4f}"
+                        for k, v in val_metrics.items()
+                    )
+                )
+
+            save_checkpoint(
+                output_dir / "last.pt",
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                method=args.method,
+                detector_config=config,
+                args=args,
+                metrics=val_metrics,
+            )
+
+            if val_metrics and args.best_metric in val_metrics:
+                current = val_metrics[args.best_metric]
+
+                if args.best_metric == "MR-2_generic":
+                    improved = current < best_value
+                else:
+                    improved = current > best_value
+
+                if improved:
+                    best_value = current
+
+                    save_checkpoint(
+                        output_dir / "best.pt",
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        epoch=epoch,
+                        method=args.method,
+                        detector_config=config,
+                        args=args,
+                        metrics=val_metrics,
+                    )
+
+                    print(
+                        f"[best] {args.best_metric}={current:.6f}"
+                    )
+
+    barrier()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
