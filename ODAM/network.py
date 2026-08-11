@@ -1910,6 +1910,8 @@ class DPGAConfig:
     alpha_max: float = 1.0
 
     project_if_conflict: bool = True
+    use_norm_cap: bool = True
+    use_gate: bool = True
     conflict_threshold: float = 0.0
     eps: float = 1e-12
 
@@ -1968,6 +1970,7 @@ class DPGAModuleStats:
     final_norm: float
 
     projected: bool
+    cap_active: bool
     norm_scale: float
     gate: float
     alpha: float
@@ -2356,11 +2359,14 @@ class DPGAController:
         #
         #   ||g_o_safe|| <= rho_m ||g_d||
         # ---------------------------------------------------------------------
-        if (
-            policy.rho <= 0
-            or not det_has_signal
-            or float(odam_norm_proj.detach().cpu()) <= cfg.eps
-        ):
+        cap_active = False
+        if not odam_has_signal:
+            norm_scale = det_norm.new_zeros(())
+            g_safe = _dpga_zeros_like(self.groups[name])
+        elif not cfg.use_norm_cap:
+            norm_scale = det_norm.new_tensor(1.0)
+            g_safe = list(g_proj)
+        elif policy.rho <= 0 or not det_has_signal:
             norm_scale = det_norm.new_zeros(())
             g_safe = _dpga_zeros_like(self.groups[name])
 
@@ -2377,6 +2383,9 @@ class DPGAController:
                 g * norm_scale
                 for g in g_proj
             ]
+            cap_active = (
+                float(norm_scale.detach().cpu()) < 1.0
+            )
 
         odam_norm_safe = _dpga_norm(g_safe)
 
@@ -2385,13 +2394,23 @@ class DPGAController:
         #
         # Dùng cosine BEFORE projection để vẫn nhớ conflict ban đầu.
         # ---------------------------------------------------------------------
-        gate = torch.sigmoid(
-            (cosine_before - policy.tau)
-            / policy.temperature
-        )
+        if cfg.use_gate:
+            gate = torch.sigmoid(
+                (cosine_before - policy.tau)
+                / policy.temperature
+            )
 
-        if policy.rho <= 0 or not det_has_signal:
-            gate = gate.new_zeros(())
+            if (
+                float(odam_norm_safe.detach().cpu()) <= cfg.eps
+                or not det_has_signal
+            ):
+                gate = gate.new_zeros(())
+        else:
+            gate = det_norm.new_tensor(
+                1.0
+                if float(odam_norm_safe.detach().cpu()) > cfg.eps
+                else 0.0
+            )
 
         effective_weight = gate * float(alpha)
 
@@ -2427,6 +2446,7 @@ class DPGAController:
                 _dpga_norm(g_final).detach().cpu()
             ),
             projected=projected,
+            cap_active=cap_active,
             norm_scale=float(norm_scale.detach().cpu()),
             gate=float(gate.detach().cpu()),
             alpha=float(alpha),
