@@ -1085,6 +1085,8 @@ def save_checkpoint(
     detector_config: DetectorConfig,
     args,
     metrics: Dict[str, float],
+    category_ids: Sequence[int],
+    label_to_cat_id: Dict[int, int],
 ):
     torch.save(
         {
@@ -1094,10 +1096,107 @@ def save_checkpoint(
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "detector_config": asdict(detector_config),
+            "category_ids": list(map(int, category_ids)),
+            "label_to_cat_id": {
+                int(label): int(cat_id)
+                for label, cat_id in label_to_cat_id.items()
+            },
             "args": vars(args),
             "metrics": metrics,
         },
         path,
+    )
+
+
+def current_world_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(float(seconds))))
+    hours, rem = divmod(seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+
+    if hours > 0:
+        return f"{hours:d}h{minutes:02d}m{seconds:02d}s"
+    if minutes > 0:
+        return f"{minutes:d}m{seconds:02d}s"
+    return f"{seconds:d}s"
+
+
+def cuda_memory_summary(device: torch.device) -> str:
+    if device.type != "cuda":
+        return "mem=cpu"
+
+    allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
+    reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
+    peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+    return (
+        f"mem={allocated:.2f}G"
+        f"/{reserved:.2f}G"
+        f" peak={peak:.2f}G"
+    )
+
+
+def write_train_log(iterator, message: str):
+    if tqdm is not None and hasattr(iterator, "write"):
+        iterator.write(message)
+    else:
+        print(message)
+
+
+def should_log_step(args, step: int, total_steps: int) -> bool:
+    interval = int(args.log_interval)
+    return (
+        interval > 0
+        and (
+            step == 0
+            or (step + 1) % interval == 0
+            or step == total_steps - 1
+        )
+    )
+
+
+def format_train_step_log(
+    args,
+    epoch: int,
+    step: int,
+    total_steps: int,
+    lr: float,
+    loss_det: float,
+    loss_odam: float,
+    loss_objective: float,
+    avg_det: float,
+    avg_odam: float,
+    avg_objective: float,
+    step_seconds: float,
+    elapsed_seconds: float,
+    device: torch.device,
+) -> str:
+    completed = step + 1
+    avg_step_seconds = elapsed_seconds / max(completed, 1)
+    eta_seconds = avg_step_seconds * max(total_steps - completed, 0)
+    effective_batch = int(args.batch_size) * current_world_size()
+
+    return (
+        f"[train] epoch={epoch + 1}/{args.epochs} "
+        f"step={completed}/{total_steps} "
+        f"method={args.method} "
+        f"lr={lr:.3e} "
+        f"loss_det={loss_det:.4f} "
+        f"loss_odam={loss_odam:.4f} "
+        f"loss_obj={loss_objective:.4f} "
+        f"avg_det={avg_det:.4f} "
+        f"avg_odam={avg_odam:.4f} "
+        f"avg_obj={avg_objective:.4f} "
+        f"step_time={step_seconds:.2f}s "
+        f"elapsed={format_duration(elapsed_seconds)} "
+        f"eta={format_duration(eta_seconds)} "
+        f"batch_per_gpu={args.batch_size} "
+        f"effective_batch={effective_batch} "
+        f"{cuda_memory_summary(device)}"
     )
 
 
@@ -1128,6 +1227,8 @@ def train_one_epoch(
     }
 
     num_steps = 0
+    total_steps = len(loader)
+    epoch_start = time.time()
 
     iterator = loader
     if tqdm is not None and rank == 0:
@@ -1138,6 +1239,8 @@ def train_one_epoch(
         )
 
     for step, (image, im_info, gt_boxes, _) in enumerate(iterator):
+        step_start = time.time()
+
         image = image.to(
             device,
             non_blocking=True,
@@ -1254,11 +1357,40 @@ def train_one_epoch(
         )
         num_steps += 1
 
+        loss_det_value = float(loss_det_reduced.cpu())
+        loss_odam_value = float(loss_odam_reduced.cpu())
+        objective_value = float(objective_reduced.cpu())
+        avg_det = totals["loss_det"] / max(num_steps, 1)
+        avg_odam = totals["loss_odam"] / max(num_steps, 1)
+        avg_objective = totals["loss_total_objective"] / max(num_steps, 1)
+
         if rank == 0 and tqdm is not None:
             iterator.set_postfix(
-                det=f"{float(loss_det_reduced):.3f}",
-                odam=f"{float(loss_odam_reduced):.3f}",
+                det=f"{loss_det_value:.3f}",
+                odam=f"{loss_odam_value:.3f}",
+                obj=f"{objective_value:.3f}",
                 lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+            )
+
+        if rank == 0 and should_log_step(args, step, total_steps):
+            write_train_log(
+                iterator,
+                format_train_step_log(
+                    args=args,
+                    epoch=epoch,
+                    step=step,
+                    total_steps=total_steps,
+                    lr=optimizer.param_groups[0]["lr"],
+                    loss_det=loss_det_value,
+                    loss_odam=loss_odam_value,
+                    loss_objective=objective_value,
+                    avg_det=avg_det,
+                    avg_odam=avg_odam,
+                    avg_objective=avg_objective,
+                    step_seconds=time.time() - step_start,
+                    elapsed_seconds=time.time() - epoch_start,
+                    device=device,
+                ),
             )
 
         if (
@@ -1687,6 +1819,12 @@ def parse_args():
     parser.add_argument("--lr-gamma", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=10,
+        help="Print rank-0 training progress every N steps. Set 0 to disable.",
+    )
 
     parser.add_argument(
         "--init-checkpoint",
@@ -1727,6 +1865,8 @@ def parse_args():
     )
     parser.add_argument(
         "--gradient-diagnostics-interval",
+        "--gradient-log-interval",
+        dest="gradient_diagnostics_interval",
         type=int,
         default=100,
         help=(
@@ -1938,6 +2078,34 @@ def main():
             ),
             encoding="utf-8",
         )
+        print(
+            "[setup] "
+            f"method={args.method} "
+            f"device={device} "
+            f"world_size={world_size} "
+            f"train_images={len(train_dataset)} "
+            f"val_images={len(val_dataset)} "
+            f"batch_per_gpu={args.batch_size} "
+            f"effective_batch={args.batch_size * world_size} "
+            f"epochs={args.epochs} "
+            f"lr={args.lr:.3e} "
+            f"lr_steps={list(args.lr_steps)} "
+            f"output={output_dir}"
+        )
+        if args.method == "dpga":
+            print(
+                "[setup-dpga] "
+                f"warmup={args.dpga_warmup} "
+                f"rampup={args.dpga_rampup} "
+                f"alpha={args.dpga_alpha} "
+                f"temperature={args.dpga_temperature} "
+                f"rho_backbone={args.rho_backbone} "
+                f"rho_fpn={args.rho_fpn} "
+                f"rho_rpn={args.rho_rpn} "
+                f"rho_roi_shared={args.rho_roi_shared} "
+                f"rho_roi_cls={args.rho_roi_cls} "
+                f"rho_roi_reg={args.rho_roi_reg}"
+            )
 
     best_value = (
         float("inf")
@@ -1975,6 +2143,16 @@ def main():
         val_metrics = {}
 
         if do_eval:
+            if is_main_process(rank):
+                print(
+                    "[eval] "
+                    f"epoch={epoch + 1}/{args.epochs} "
+                    f"split=val "
+                    f"images={len(val_dataset)} "
+                    f"score_thr={args.eval_score_threshold} "
+                    f"nms={args.eval_nms} "
+                    f"max_det={args.max_detections}"
+                )
             val_metrics = validate(
                 model=model,
                 loader=val_loader,
@@ -2007,10 +2185,12 @@ def main():
             )
 
             print(
-                f"\nEpoch {epoch}/{args.epochs - 1} "
-                f"| method={args.method} "
-                f"| det_loss={train_metrics['loss_det']:.4f} "
-                f"| odam_loss={train_metrics['loss_odam']:.4f}"
+                f"\n[epoch] epoch={epoch + 1}/{args.epochs} "
+                f"method={args.method} "
+                f"seconds={format_duration(elapsed)} "
+                f"det_loss={train_metrics['loss_det']:.4f} "
+                f"odam_loss={train_metrics['loss_odam']:.4f} "
+                f"objective={train_metrics['loss_total_objective']:.4f}"
             )
 
             if val_metrics:
@@ -2031,6 +2211,8 @@ def main():
                 detector_config=config,
                 args=args,
                 metrics=val_metrics,
+                category_ids=train_dataset.category_ids,
+                label_to_cat_id=train_dataset.label_to_cat_id,
             )
 
             if val_metrics and args.best_metric in val_metrics:
@@ -2054,6 +2236,8 @@ def main():
                         detector_config=config,
                         args=args,
                         metrics=val_metrics,
+                        category_ids=train_dataset.category_ids,
+                        label_to_cat_id=train_dataset.label_to_cat_id,
                     )
 
                     print(

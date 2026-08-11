@@ -143,6 +143,32 @@ def make_detector_config(
     return DetectorConfig(num_classes=num_classes)
 
 
+def validate_checkpoint_categories(
+    checkpoint: Dict,
+    dataset: CocoDetectionTrainDataset,
+    rank: int,
+):
+    saved_category_ids = checkpoint.get("category_ids")
+    test_category_ids = list(map(int, dataset.category_ids))
+
+    if saved_category_ids is None:
+        if rank == 0:
+            print(
+                "[warning] checkpoint does not contain category_ids; "
+                "test.py can only verify num_classes for this checkpoint. "
+                "Retrain with the updated train.py to make category mapping "
+                "fail-closed."
+            )
+        return
+
+    saved_category_ids = list(map(int, saved_category_ids))
+    if saved_category_ids != test_category_ids:
+        raise ValueError(
+            "Checkpoint category_ids do not match test annotations: "
+            f"checkpoint={saved_category_ids}, test={test_category_ids}"
+        )
+
+
 def load_model(
     checkpoint: Dict,
     config: DetectorConfig,
@@ -314,6 +340,11 @@ def main():
         args.test_ann,
         min_size=args.min_size,
         max_size=args.max_size,
+    )
+    validate_checkpoint_categories(
+        checkpoint,
+        test_dataset,
+        rank,
     )
 
     config = make_detector_config(
