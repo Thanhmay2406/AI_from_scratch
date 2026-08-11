@@ -857,6 +857,171 @@ def compute_generic_mr2(
     )
 
 
+def _odam_quality_enabled(args) -> bool:
+    configured = getattr(args, "eval_odam_quality", None)
+    if configured is not None:
+        return bool(configured)
+    return getattr(args, "method", None) in ("odam", "dpga")
+
+
+def _dam_energy_in_box(
+    dam_flat: torch.Tensor,
+    dam_h: int,
+    dam_w: int,
+    gt_box: torch.Tensor,
+    resized_h: float,
+    resized_w: float,
+) -> Tuple[float, float]:
+    if dam_h <= 0 or dam_w <= 0 or dam_flat.numel() != dam_h * dam_w:
+        return float("nan"), 0.0
+
+    dam = dam_flat.reshape(dam_h, dam_w).float().clamp(min=0)
+    total = float(dam.sum().detach().cpu())
+    if total <= 1e-12:
+        return float("nan"), total
+
+    x_scale = float(dam_w) / max(float(resized_w), 1.0)
+    y_scale = float(dam_h) / max(float(resized_h), 1.0)
+
+    x1 = int(math.floor(float(gt_box[0]) * x_scale))
+    y1 = int(math.floor(float(gt_box[1]) * y_scale))
+    x2 = int(math.ceil(float(gt_box[2]) * x_scale))
+    y2 = int(math.ceil(float(gt_box[3]) * y_scale))
+
+    x1 = min(max(x1, 0), dam_w)
+    x2 = min(max(x2, 0), dam_w)
+    y1 = min(max(y1, 0), dam_h)
+    y2 = min(max(y2, 0), dam_h)
+
+    if x2 <= x1 or y2 <= y1:
+        return 0.0, total
+
+    inside = float(dam[y1:y2, x1:x2].sum().detach().cpu())
+    return inside / max(total, 1e-12), total
+
+
+def compute_odam_quality_rows(
+    pred: torch.Tensor,
+    gt_boxes: torch.Tensor,
+    meta: Dict,
+    score_threshold: float,
+    iou_threshold: float,
+) -> List[Dict]:
+    """
+    DAM localization sanity metric.
+
+    For matched prediction/GT pairs, measure the fraction of positive DAM energy
+    that falls inside the matched GT box. This is an internal ODAM/XAI diagnostic,
+    not an official dataset metric.
+    """
+    if pred.numel() == 0 or pred.shape[1] <= 8:
+        return []
+
+    valid_gt = gt_boxes[
+        (gt_boxes[:, 4] > 0)
+        & torch.isfinite(gt_boxes).all(dim=1)
+    ]
+    if valid_gt.numel() == 0:
+        return []
+
+    pred = pred[
+        torch.isfinite(pred[:, :6]).all(dim=1)
+        & (pred[:, 4] >= float(score_threshold))
+    ]
+    if pred.numel() == 0:
+        return []
+
+    order = pred[:, 4].argsort(descending=True)
+    pred = pred[order]
+
+    gt_xyxy = valid_gt[:, :4]
+    gt_labels = valid_gt[:, 4].long()
+    gt_matched = torch.zeros(
+        (valid_gt.shape[0],),
+        dtype=torch.bool,
+        device=valid_gt.device,
+    )
+
+    rows = []
+    for det in pred:
+        label = int(det[5].item())
+        same_label = gt_labels == label
+        available = same_label & (~gt_matched)
+        if not available.any():
+            continue
+
+        candidate_indices = torch.nonzero(
+            available,
+            as_tuple=False,
+        ).squeeze(1)
+        ious = torch.as_tensor(
+            _iou_numpy(
+                det[:4].detach().cpu().numpy(),
+                gt_xyxy[candidate_indices].detach().cpu().numpy(),
+            ),
+            device=gt_boxes.device,
+        )
+        best_local = int(torch.argmax(ious).item())
+        best_iou = float(ious[best_local].detach().cpu())
+        if best_iou < float(iou_threshold):
+            continue
+
+        gt_index = candidate_indices[best_local]
+        gt_matched[gt_index] = True
+
+        dam_h = int(round(float(det[-2].detach().cpu())))
+        dam_w = int(round(float(det[-1].detach().cpu())))
+        energy, total = _dam_energy_in_box(
+            det[6:-2],
+            dam_h,
+            dam_w,
+            valid_gt[gt_index, :4],
+            resized_h=float(meta["resized_h"]),
+            resized_w=float(meta["resized_w"]),
+        )
+
+        if not math.isfinite(energy):
+            continue
+
+        rows.append(
+            {
+                "image_id": int(meta["image_id"]),
+                "category_label": label,
+                "score": float(det[4].detach().cpu()),
+                "iou": best_iou,
+                "dam_energy_in_gt": energy,
+                "dam_energy_total": total,
+                "dam_h": dam_h,
+                "dam_w": dam_w,
+            }
+        )
+
+    return rows
+
+
+def summarize_odam_quality(rows: Sequence[Dict]) -> Dict[str, float]:
+    if not rows:
+        return {
+            "ODAM_quality": float("nan"),
+            "ODAM_quality_samples": 0.0,
+            "ODAM_quality_mean_iou": float("nan"),
+        }
+
+    energy = np.asarray(
+        [float(row["dam_energy_in_gt"]) for row in rows],
+        dtype=np.float64,
+    )
+    iou = np.asarray(
+        [float(row["iou"]) for row in rows],
+        dtype=np.float64,
+    )
+    return {
+        "ODAM_quality": float(np.mean(energy)),
+        "ODAM_quality_samples": float(len(rows)),
+        "ODAM_quality_mean_iou": float(np.mean(iou)),
+    }
+
+
 # =============================================================================
 # Validation
 # =============================================================================
@@ -874,9 +1039,12 @@ def validate(
     epoch: int,
 ) -> Dict[str, float]:
     model.eval()
-    unwrap_model(model).set_odam_inference(False)
+    raw_model = unwrap_model(model)
+    eval_odam_quality = _odam_quality_enabled(args)
+    raw_model.set_odam_inference(eval_odam_quality)
 
     predictions_local: List[Dict] = []
+    odam_quality_rows_local: List[Dict] = []
     image_ids_local: List[int] = []
 
     iterator = loader
@@ -887,14 +1055,23 @@ def validate(
             leave=False,
         )
 
-    # Fast detection-only inference does not require gradients.
-    with torch.no_grad():
-        for image, im_info, _, metas in iterator:
+    grad_context = (
+        torch.enable_grad()
+        if eval_odam_quality
+        else torch.no_grad()
+    )
+
+    with grad_context:
+        for image, im_info, gt_boxes, metas in iterator:
             image = image.to(
                 device,
                 non_blocking=True,
             )
             im_info = im_info.to(
+                device,
+                non_blocking=True,
+            )
+            gt_boxes = gt_boxes.to(
                 device,
                 non_blocking=True,
             )
@@ -925,9 +1102,21 @@ def validate(
             )
 
             predictions_local.extend(pred_list)
+            if eval_odam_quality:
+                odam_quality_rows_local.extend(
+                    compute_odam_quality_rows(
+                        pred=pred,
+                        gt_boxes=gt_boxes[0],
+                        meta=meta,
+                        score_threshold=args.eval_score_threshold,
+                        iou_threshold=args.odam_quality_iou,
+                    )
+                )
             image_ids_local.append(
                 int(meta["image_id"])
             )
+
+    raw_model.set_odam_inference(False)
 
     gathered_predictions = gather_objects(
         predictions_local,
@@ -939,18 +1128,27 @@ def validate(
         rank,
         world_size,
     )
+    gathered_quality = gather_objects(
+        odam_quality_rows_local,
+        rank,
+        world_size,
+    )
 
     if rank != 0:
         return {}
 
     predictions = []
     image_ids = []
+    odam_quality_rows = []
 
     for part in gathered_predictions:
         predictions.extend(part)
 
     for part in gathered_ids:
         image_ids.extend(part)
+
+    for part in gathered_quality:
+        odam_quality_rows.extend(part)
 
     image_ids = sorted(set(image_ids))
 
@@ -969,6 +1167,16 @@ def validate(
             iou_threshold=0.5,
         )
 
+    if eval_odam_quality:
+        metrics.update(
+            summarize_odam_quality(odam_quality_rows)
+        )
+        quality_file = output_dir / f"odam_quality_epoch_{epoch:03d}.json"
+        quality_file.write_text(
+            json.dumps(odam_quality_rows),
+            encoding="utf-8",
+        )
+
     pred_file = output_dir / f"predictions_epoch_{epoch:03d}.json"
     pred_file.write_text(
         json.dumps(predictions),
@@ -983,12 +1191,69 @@ def validate(
 # =============================================================================
 
 
+DPGA_ABLATION_PRESETS = {
+    "full": {
+        "projection": True,
+        "norm_cap": True,
+        "gate": True,
+        "label": "A6_full_dpga",
+    },
+    "projection-only": {
+        "projection": True,
+        "norm_cap": False,
+        "gate": False,
+        "label": "A2_projection",
+    },
+    "norm-cap-only": {
+        "projection": False,
+        "norm_cap": True,
+        "gate": False,
+        "label": "A3_norm_cap",
+    },
+    "gate-only": {
+        "projection": False,
+        "norm_cap": False,
+        "gate": True,
+        "label": "A4_gate",
+    },
+    "projection-norm-cap": {
+        "projection": True,
+        "norm_cap": True,
+        "gate": False,
+        "label": "A5_projection_norm_cap",
+    },
+}
+
+
+def apply_dpga_ablation_preset(args):
+    if args.method != "dpga":
+        if args.dpga_ablation != "full":
+            raise ValueError(
+                "--dpga-ablation is only valid with --method dpga."
+            )
+        args.dpga_ablation_label = args.method
+        return args
+
+    if args.dpga_ablation == "custom":
+        args.dpga_ablation_label = "custom_dpga"
+        return args
+
+    preset = DPGA_ABLATION_PRESETS[args.dpga_ablation]
+    args.dpga_projection = bool(preset["projection"])
+    args.dpga_norm_cap = bool(preset["norm_cap"])
+    args.dpga_gate = bool(preset["gate"])
+    args.dpga_ablation_label = str(preset["label"])
+    return args
+
+
 def make_dpga_config(args) -> DPGAConfig:
     return DPGAConfig(
         warmup_epochs=args.dpga_warmup,
         rampup_epochs=args.dpga_rampup,
         alpha_max=args.dpga_alpha,
-        project_if_conflict=True,
+        project_if_conflict=args.dpga_projection,
+        use_norm_cap=args.dpga_norm_cap,
+        use_gate=args.dpga_gate,
         conflict_threshold=0.0,
         module_policies={
             "backbone": DPGAModulePolicy(
@@ -1427,6 +1692,9 @@ CSV_FIELDS = [
     "AR10",
     "AR100",
     "MR-2_generic",
+    "ODAM_quality",
+    "ODAM_quality_samples",
+    "ODAM_quality_mean_iou",
 ]
 
 
@@ -1440,9 +1708,17 @@ GRADIENT_DIAGNOSTIC_FIELDS = [
     "loss_odam",
     "cosine_raw",
     "det_norm",
+    "det_gradient_norm",
     "odam_norm_raw",
+    "raw_odam_norm",
+    "projected_odam_norm",
+    "capped_odam_norm",
+    "final_odam_norm",
     "odam_norm_safe",
     "aux_to_det_raw",
+    "aux_to_det_projected",
+    "aux_to_det_capped",
+    "aux_to_det_final",
     "aux_to_det_effective",
     "directional_margin",
     "final_cosine_to_det",
@@ -1626,6 +1902,7 @@ def compute_odam_gradient_diagnostics(
         dot = float(dot_t.detach().cpu())
         final_norm = float(final_norm_t.detach().cpu())
         final_dot = float(final_dot_t.detach().cpu())
+        final_odam_norm = abs(float(odam_weight)) * odam_norm
 
         cosine_raw = _safe_ratio(
             dot,
@@ -1635,7 +1912,6 @@ def compute_odam_gradient_diagnostics(
             final_dot,
             det_norm * final_norm,
         )
-        aux_effective_norm = abs(float(odam_weight)) * odam_norm
         directional_margin = _safe_ratio(
             final_dot,
             det_norm * det_norm,
@@ -1652,11 +1928,22 @@ def compute_odam_gradient_diagnostics(
                 "loss_odam": float(loss_odam.detach().cpu()),
                 "cosine_raw": cosine_raw,
                 "det_norm": det_norm,
+                "det_gradient_norm": det_norm,
                 "odam_norm_raw": odam_norm,
+                "raw_odam_norm": odam_norm,
+                "projected_odam_norm": odam_norm,
+                "capped_odam_norm": odam_norm,
+                "final_odam_norm": final_odam_norm,
                 "odam_norm_safe": odam_norm,
                 "aux_to_det_raw": _safe_ratio(odam_norm, det_norm),
+                "aux_to_det_projected": _safe_ratio(odam_norm, det_norm),
+                "aux_to_det_capped": _safe_ratio(odam_norm, det_norm),
+                "aux_to_det_final": _safe_ratio(
+                    final_odam_norm,
+                    det_norm,
+                ),
                 "aux_to_det_effective": _safe_ratio(
-                    aux_effective_norm,
+                    final_odam_norm,
                     det_norm,
                 ),
                 "directional_margin": directional_margin,
@@ -1664,7 +1951,7 @@ def compute_odam_gradient_diagnostics(
                 "final_angle_deg": _final_angle_degrees(final_cosine),
                 "conflict_raw": int(cosine_raw < 0.0),
                 "dominance_raw": int(odam_norm > det_norm),
-                "dominance_effective": int(aux_effective_norm > det_norm),
+                "dominance_effective": int(final_odam_norm > det_norm),
                 "unsafe_descent": int(directional_margin <= 0.0),
                 "projected": 0,
                 "cap_active": 0,
@@ -1691,12 +1978,27 @@ def dpga_stats_to_diagnostic_rows(
     for module_name, module_stats in stats.modules.items():
         det_norm = float(module_stats.det_norm)
         odam_norm_raw = float(module_stats.odam_norm_before)
+        odam_norm_projected = float(
+            module_stats.odam_norm_after_projection
+        )
         odam_norm_safe = float(module_stats.odam_norm_after_cap)
+        final_odam_norm = (
+            abs(float(module_stats.effective_weight))
+            * odam_norm_safe
+        )
         effective_aux_norm = (
             abs(float(module_stats.effective_weight))
             * odam_norm_safe
         )
         raw_aux_ratio = _safe_ratio(odam_norm_raw, det_norm)
+        projected_aux_ratio = _safe_ratio(
+            odam_norm_projected,
+            det_norm,
+        )
+        capped_aux_ratio = _safe_ratio(
+            odam_norm_safe,
+            det_norm,
+        )
         effective_aux_ratio = _safe_ratio(effective_aux_norm, det_norm)
 
         final_dot = (
@@ -1726,9 +2028,17 @@ def dpga_stats_to_diagnostic_rows(
                 "loss_odam": float(loss_odam.detach().cpu()),
                 "cosine_raw": float(module_stats.cosine_before),
                 "det_norm": det_norm,
+                "det_gradient_norm": det_norm,
                 "odam_norm_raw": odam_norm_raw,
+                "raw_odam_norm": odam_norm_raw,
+                "projected_odam_norm": odam_norm_projected,
+                "capped_odam_norm": odam_norm_safe,
+                "final_odam_norm": final_odam_norm,
                 "odam_norm_safe": odam_norm_safe,
                 "aux_to_det_raw": raw_aux_ratio,
+                "aux_to_det_projected": projected_aux_ratio,
+                "aux_to_det_capped": capped_aux_ratio,
+                "aux_to_det_final": effective_aux_ratio,
                 "aux_to_det_effective": effective_aux_ratio,
                 "directional_margin": directional_margin,
                 "final_cosine_to_det": final_cosine,
@@ -1738,10 +2048,7 @@ def dpga_stats_to_diagnostic_rows(
                 "dominance_effective": int(effective_aux_norm > det_norm),
                 "unsafe_descent": int(directional_margin <= 0.0),
                 "projected": int(module_stats.projected),
-                "cap_active": int(
-                    odam_norm_safe
-                    < float(module_stats.odam_norm_after_projection)
-                ),
+                "cap_active": int(module_stats.cap_active),
                 "norm_scale": float(module_stats.norm_scale),
                 "gate": float(module_stats.gate),
                 "alpha": float(module_stats.alpha),
@@ -1806,7 +2113,7 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=4)
 
     # Train
-    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=0.0025)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -1844,6 +2151,54 @@ def parse_args():
     parser.add_argument("--dpga-warmup", type=int, default=4)
     parser.add_argument("--dpga-rampup", type=int, default=4)
     parser.add_argument("--dpga-alpha", type=float, default=1.0)
+    parser.add_argument(
+        "--dpga-ablation",
+        choices=(
+            "full",
+            "projection-only",
+            "norm-cap-only",
+            "gate-only",
+            "projection-norm-cap",
+            "custom",
+        ),
+        default="full",
+        help=(
+            "Named DPGA ablation preset for running one job at a time. "
+            "Use custom if you want manual --no-dpga-* flags to define the run."
+        ),
+    )
+    parser.add_argument(
+        "--no-dpga-projection",
+        dest="dpga_projection",
+        action="store_false",
+        help=(
+            "Manual DPGA ablation: disable conflict projection. "
+            "Use --dpga-ablation custom for this flag to take effect."
+        ),
+    )
+    parser.add_argument(
+        "--no-dpga-norm-cap",
+        dest="dpga_norm_cap",
+        action="store_false",
+        help=(
+            "Manual DPGA ablation: disable module-wise auxiliary norm cap. "
+            "Use --dpga-ablation custom for this flag to take effect."
+        ),
+    )
+    parser.add_argument(
+        "--no-dpga-gate",
+        dest="dpga_gate",
+        action="store_false",
+        help=(
+            "Manual DPGA ablation: disable adaptive cosine gate. "
+            "Use --dpga-ablation custom for this flag to take effect."
+        ),
+    )
+    parser.set_defaults(
+        dpga_projection=True,
+        dpga_norm_cap=True,
+        dpga_gate=True,
+    )
     parser.add_argument(
         "--dpga-temperature",
         type=float,
@@ -1898,11 +2253,40 @@ def parse_args():
     )
     parser.add_argument(
         "--best-metric",
-        choices=("AP", "AP50", "AP75", "MR-2_generic"),
+        choices=(
+            "AP",
+            "AP50",
+            "AP75",
+            "MR-2_generic",
+            "ODAM_quality",
+        ),
         default="AP",
     )
+    parser.add_argument(
+        "--eval-odam-quality",
+        dest="eval_odam_quality",
+        action="store_true",
+        default=None,
+        help=(
+            "Compute DAM energy-in-GT localization metric during validation. "
+            "Default: enabled for ODAM/DPGA and disabled for baseline."
+        ),
+    )
+    parser.add_argument(
+        "--no-eval-odam-quality",
+        dest="eval_odam_quality",
+        action="store_false",
+        help="Disable DAM localization metric during validation.",
+    )
+    parser.add_argument(
+        "--odam-quality-iou",
+        type=float,
+        default=0.5,
+        help="IoU threshold for matching predictions to GT for ODAM_quality.",
+    )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    return apply_dpga_ablation_preset(args)
 
 
 # =============================================================================
@@ -2059,6 +2443,12 @@ def main():
     if is_main_process(rank):
         experiment_meta = {
             "method": args.method,
+            "dpga_ablation": getattr(args, "dpga_ablation", None),
+            "dpga_ablation_label": getattr(
+                args,
+                "dpga_ablation_label",
+                args.method,
+            ),
             "world_size": world_size,
             "device": str(device),
             "categories": train_dataset.category_ids,
@@ -2095,9 +2485,13 @@ def main():
         if args.method == "dpga":
             print(
                 "[setup-dpga] "
+                f"ablation={args.dpga_ablation_label} "
                 f"warmup={args.dpga_warmup} "
                 f"rampup={args.dpga_rampup} "
                 f"alpha={args.dpga_alpha} "
+                f"projection={int(args.dpga_projection)} "
+                f"norm_cap={int(args.dpga_norm_cap)} "
+                f"gate={int(args.dpga_gate)} "
                 f"temperature={args.dpga_temperature} "
                 f"rho_backbone={args.rho_backbone} "
                 f"rho_fpn={args.rho_fpn} "
